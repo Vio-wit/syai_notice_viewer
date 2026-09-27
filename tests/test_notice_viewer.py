@@ -141,12 +141,12 @@ class NoticeViewerTests(unittest.TestCase):
     def test_credential_status_is_masked_and_supports_external_file(self):
         with TemporaryDirectory() as temp_dir:
             credentials_path = Path(temp_dir) / "credentials.json"
-            credentials_path.write_text(json.dumps({"username": "2416486001", "password": "secret-value"}), encoding="utf-8")
+            credentials_path.write_text(json.dumps({"username": "2026000000", "password": "secret-value"}), encoding="utf-8")
             with patch.dict(os.environ, {"TEC_USERNAME": "", "TEC_PASSWORD": ""}):
                 result = credential_status({"credentials_file": str(credentials_path)})
 
             self.assertEqual(result["status"], "READY")
-            self.assertEqual(result["username"], "24***01")
+            self.assertEqual(result["username"], "20***00")
             self.assertEqual(result["username_source"], "credentials_file")
             self.assertTrue(result["password_configured"])
             self.assertNotIn("secret-value", json.dumps(result))
