@@ -1,0 +1,19 @@
+{
+  "base_url": "http://lb.tec.suda.edu.cn",
+  "sso_base": "https://sso.tec.suda.edu.cn",
+  "service_url": "http://lb.tec.suda.edu.cn/login",
+  "credentials_file": "",
+  "notice_types": ["notice", "fw", "xngs"],
+  "max_items_per_type": 200,
+  "download_attachments": true,
+  "max_attachment_bytes": 52428800,
+  "request_interval_seconds": 0.5,
+  "user_agent": "Personal-College-Notice-Viewer/0.1",
+  "collection_start_date": "",
+  "bind_host": "127.0.0.1",
+  "port": 8765,
+  "notifications": {
+    "enabled": true,
+    "desktop": false
+  }
+}
