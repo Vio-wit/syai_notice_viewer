@@ -113,6 +113,16 @@ Invoke-RestMethod -Method Post http://127.0.0.1:8765/api/notices/notice%3A10108/
 
 AI 配置和单条解读 API 仅允许本机访问。其他 Agent 仍可以按原协议直接 POST `/api/notices/{notice_key}/analysis` 和 `/api/notices/{notice_key}/brief`，不依赖外部 AI。
 
+如果要给已有页面批量补齐 AI 解读，可以使用页面管理页或批量接口。默认跳过已有纪要；加 `force` 才会全部重算：
+
+```powershell
+.\.venv\Scripts\python.exe notice_viewer.py ai-brief-all --limit 100
+.\.venv\Scripts\python.exe notice_viewer.py ai-brief-all --force --type professional
+Invoke-RestMethod -Method Post `
+  -Uri 'http://127.0.0.1:8765/api/notices/ai-brief-batch' `
+  -ContentType 'application/json' -Body '{"type":"professional","limit":100,"force":false}'
+```
+
 ## 专业模式：通用网页采集与分析
 
 专业模式是从原项目的复杂爬虫逻辑中抽出的轻量实现，用于采集其他学院、实验室或公开信息页面。它保留了原项目中比较有价值的边界：同源/域名白名单、robots.txt、重定向检查、私网与回环地址拦截、登录会话、Bearer/自定义请求头、HTML/JSON/TEXT 解析、CSS 选择器、分页、深度/页数/响应体/总流量上限、附件引用和增量去重；不引入 Spring、MySQL、MinIO 或 RagFlow。
@@ -166,6 +176,8 @@ py -m venv .venv
 ```
 
 然后打开 <http://127.0.0.1:8765>。
+
+看板顶部的“页面管理 / AI / 导出”可以按来源显示通知（包括专业模式页面）、触发新增页面 AI 解析或全量重解析，并查看专业模式状态。
 
 ### 在网页中配置账号
 
@@ -238,6 +250,15 @@ http://127.0.0.1:8765/?q=比赛&since=2026-08-31&until=2026-09-27&category=compe
 
 提取结果保存在 `data/extracted/`，原文快照保存在 `data/originals/`，纪要保存在 `data/summaries/`。支持 TXT、Markdown、CSV、JSON、DOCX、XLSX、PPTX；PDF 需要 `pypdf`，扫描 PDF 和图片需要 OCR，旧版 DOC/XLS/PPT 需要转换器。失败或不支持的格式会记录状态，不会伪造文本。
 
+导出通知数据（不包含密码、Token 或本地附件路径）：
+
+```powershell
+.\.venv\Scripts\python.exe notice_viewer.py export-data --format zip
+.\.venv\Scripts\python.exe notice_viewer.py export-data --format csv --type professional --output .\professional-notices.csv
+```
+
+本地服务也提供 `GET /api/export?format=json|csv|markdown|zip`，可附加 `type`、`category`、`since`、`until`、`q` 和 `limit` 筛选。网页管理页提供 JSON、CSV、Markdown 和 ZIP 下载按钮。
+
 检查账号和配置：
 
 ```powershell
@@ -264,6 +285,7 @@ attachments/           登录态下载的附件
 data/originals/        通知原文快照
 data/summaries/        规则版或 Agent 版纪要
 data/extracted/        附件提取文本
+data/exports/          CLI 导出文件（忽略，不提交）
 tests/                 不登录、不联网的单元测试
 ```
 

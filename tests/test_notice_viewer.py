@@ -1,5 +1,6 @@
 import unittest
 import zipfile
+import io
 import json
 import os
 import requests
@@ -18,6 +19,8 @@ from notice_viewer import (
     NoticeSpider,
     NoticeStore,
     credential_status,
+    export_notice_data,
+    generate_ai_briefs_for_notices,
     generate_ai_brief_for_notice,
     in_date_range,
     normalize_date,
@@ -382,6 +385,59 @@ class NoticeViewerTests(unittest.TestCase):
             self.assertEqual(len(first_page), 2)
             self.assertEqual(len(second_page), 1)
             self.assertNotEqual(first_page[0]["notice_key"], second_page[0]["notice_key"])
+
+    def test_export_formats_filter_page_type_and_strip_local_paths(self):
+        item = {
+            "id": "profile:1",
+            "type": "professional",
+            "title": "专业页面",
+            "department": "实验室",
+            "date": "2026/10/01",
+            "published_text": "2026/10/01",
+            "published_at": "2026-10-01",
+            "url": "https://example.edu/news/1",
+            "content": "专业页面正文",
+            "attachments": [{"name": "通知.pdf", "url": "https://example.edu/a.pdf"}],
+        }
+        with TemporaryDirectory() as temp_dir:
+            store = NoticeStore(Path(temp_dir) / "notices.sqlite3")
+            store.upsert(item)
+            store.upsert_attachment("professional:profile:1", item["attachments"][0])
+            body, content_type, filename = export_notice_data(store, "json", notice_type="professional")
+            payload = json.loads(body.decode("utf-8"))
+            self.assertEqual(content_type, "application/json; charset=utf-8")
+            self.assertEqual(filename, "college-notices.json")
+            self.assertEqual(payload["count"], 1)
+            self.assertNotIn("local_path", payload["items"][0]["attachments"][0])
+            csv_body, _, _ = export_notice_data(store, "csv", notice_type="professional")
+            self.assertIn("专业页面", csv_body.decode("utf-8-sig"))
+            zip_body, zip_type, _ = export_notice_data(store, "zip", notice_type="professional")
+            with zipfile.ZipFile(io.BytesIO(zip_body)) as archive:
+                self.assertEqual(zip_type, "application/zip")
+                self.assertEqual(set(archive.namelist()), {"college-notices.json", "college-notices.csv", "college-notices.md"})
+
+    def test_batch_ai_brief_skips_existing_and_processes_missing(self):
+        item = {
+            "id": "1",
+            "type": "professional",
+            "title": "批量 AI 页面",
+            "department": "测试部门",
+            "date": "2026/10/01",
+            "published_text": "2026/10/01",
+            "published_at": "2026-10-01",
+            "url": "https://example.edu/news/1",
+            "content": "需要解析的正文",
+            "attachments": [],
+        }
+        with TemporaryDirectory() as temp_dir:
+            store = NoticeStore(Path(temp_dir) / "notices.sqlite3")
+            store.upsert(item)
+            with patch("notice_viewer.NoticeAIClient") as client_class, patch("notice_viewer.generate_ai_brief_for_notice") as generator:
+                client_class.return_value.ready = True
+                result = generate_ai_briefs_for_notices({"ai": {}}, store, notice_type="professional")
+            self.assertEqual(result["succeeded"], 1)
+            self.assertEqual(result["failed"], 0)
+            generator.assert_called_once()
 
     def test_fetch_list_respects_per_type_limit(self):
         source = "".join(

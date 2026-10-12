@@ -11,7 +11,7 @@
 - 原文快照：`data/originals/`
 - 纪要：`data/summaries/`
 - 附件提取文本：`data/extracted/`
-- 当前来源类型：`notice`（通知公告）、`fw`（学校发文）、`xngs`（校内公示）
+- 当前来源类型：`notice`（通知公告）、`fw`（学校发文）、`xngs`（校内公示）、`professional`（专业模式页面）
 - 默认只绑定本机地址，不要改成 `0.0.0.0`，除非另行增加身份认证。
 
 凭据优先使用当前会话的环境变量，不要把账号、密码、Token 写入本文件或提交到 Git：
@@ -183,10 +183,17 @@ Agent 纪要写回后，网页详情会显示 `updated_at` 对应的最近解析
 - `update` 不会生成、也不会覆盖 `notice_briefs`；采集后必须对结果里的 `new_notice_keys` 和 `changed` 对应的 key 重新生成纪要并写回，否则新通知没有纪要、内容变化的通知仍是旧纪要。
 - 如果个人实例配置了 `ai.enabled=true`、`ai.auto_brief=true` 和自己的 OpenAI 兼容 API Key，`update` 会自动对这些 key 调用 AI 并写回分析、纪要和 Markdown；AI 调用失败不应阻断采集，需查看结果中的 `ai.errors`。
 - AI 配置接口 `GET /api/config/ai/status`、`POST /api/config/ai` 和单条解读接口 `POST /api/notices/{notice_key}/ai-brief` 仅允许本机访问，API Key 不得写入 Git 跟踪文件。
+- 已有页面可通过 `ai-brief-all` 或 `POST /api/notices/ai-brief-batch` 批量生成 AI 解读；默认跳过已有纪要，只有明确传 `--force` 或 `{"force":true}` 才重算。批量结果中的 `succeeded`、`skipped`、`failed` 和 `errors` 必须回报。
 - `source` 使用 `agent:<名称>`，规则分析使用 `rules-v1`。
 - 建议必须是可执行动作，不要只写“值得关注”。
 - `confidence` 范围为 `0` 到 `1`。
 - 不确定的信息写“需查看原文/附件确认”，不要编造截止时间、地点或资格。
+
+页面管理与导出：
+
+- `GET /manage`：本地页面显示管理，按来源筛选、查看 AI/专业模式状态和触发批量解析。
+- `GET /api/export?format=json|csv|markdown|zip`：导出通知数据，可附加 `type`、`category`、`since`、`until`、`q`、`limit`。
+- `export-data` 命令默认将导出文件写入被忽略的 `data/exports/`；导出内容不包含密码、Token 或本地附件路径。
 
 ## 7. 采集安全规则
 

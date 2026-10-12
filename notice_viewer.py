@@ -9,8 +9,10 @@ Spring、MySQL、MinIO 或 RagFlow。命令行和本地 HTTP API 都可以触发
 from __future__ import annotations
 
 import argparse
+import csv
 import hashlib
 import html
+import io
 import json
 import logging
 import os
@@ -20,6 +22,7 @@ import subprocess
 import sys
 import threading
 import time
+import zipfile
 from contextlib import contextmanager
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -52,6 +55,7 @@ NOTICE_TYPES = {
     "notice": "通知公告",
     "fw": "学校发文",
     "xngs": "校内公示",
+    "professional": "专业模式页面",
 }
 
 DEFAULT_CONFIG: dict[str, Any] = {
@@ -680,6 +684,7 @@ class NoticeStore:
         unread: bool = False,
         limit: int = 100,
         offset: int = 0,
+        notice_type: str = "",
         category: str = "",
         since: str = "",
         until: str = "",
@@ -691,6 +696,9 @@ class NoticeStore:
             conditions: list[str] = []
             if unread:
                 conditions.append("is_unread=1")
+            if notice_type and notice_type in NOTICE_TYPES:
+                conditions.append("notice_type=?")
+                args.append(notice_type)
             q = normalize_text(q)[:100]
             if q:
                 like = f"%{q}%"
@@ -992,12 +1000,146 @@ def generate_ai_brief_for_notice(
     return {"notice_key": key, "analysis": analysis, "brief": brief, "model": generated.get("model", "")}
 
 
+def generate_ai_briefs_for_notices(
+    config: dict[str, Any],
+    store: NoticeStore | None = None,
+    notice_type: str = "",
+    category: str = "",
+    since: str = "",
+    until: str = "",
+    q: str = "",
+    limit: int = 100,
+    force: bool = False,
+) -> dict[str, Any]:
+    """批量为已有页面补齐或重生成 AI 解析。"""
+
+    target_store = store or NoticeStore()
+    client = NoticeAIClient(config)
+    if not client.ready:
+        return {"status": "FAILED", "processed": 0, "succeeded": 0, "skipped": 0, "failed": 0, "errors": [], "error": "AI 未启用或未配置有效 API Key"}
+    rows = _export_rows(target_store, notice_type, category, since, until, q, limit)
+    result: dict[str, Any] = {"status": "SUCCESS", "processed": 0, "succeeded": 0, "skipped": 0, "failed": 0, "errors": []}
+    for row in rows:
+        result["processed"] += 1
+        if row.get("brief") and not force:
+            result["skipped"] += 1
+            continue
+        try:
+            generate_ai_brief_for_notice(config, row["notice_key"], target_store)
+            result["succeeded"] += 1
+        except Exception as exc:
+            result["failed"] += 1
+            result["errors"].append({"notice_key": row["notice_key"], "error": str(exc)[:500]})
+    if result["failed"]:
+        result["status"] = "PARTIAL" if result["succeeded"] or result["skipped"] else "FAILED"
+    result["finished_at"] = now_text()
+    return result
+
+
 def export_existing_artifacts() -> dict[str, Any]:
     store = NoticeStore()
     rows = store.list_notices(limit=500)
     for row in rows:
         refresh_notice_artifacts(store, row["notice_key"])
     return {"status": "SUCCESS", "exported": len(rows), "finished_at": now_text()}
+
+
+def _exportable_notice(row: dict[str, Any]) -> dict[str, Any]:
+    result = dict(row)
+    result["attachments"] = [
+        {key: attachment.get(key, "") for key in ("name", "url", "status")}
+        for attachment in row.get("attachments", [])
+    ]
+    return result
+
+
+def _export_rows(
+    store: NoticeStore,
+    notice_type: str = "",
+    category: str = "",
+    since: str = "",
+    until: str = "",
+    q: str = "",
+    limit: int = 500,
+) -> list[dict[str, Any]]:
+    return [_exportable_notice(row) for row in store.list_notices(
+        notice_type=notice_type,
+        category=category,
+        since=since,
+        until=until,
+        q=q,
+        limit=max(1, min(int(limit), 500)),
+    )]
+
+
+def _export_json(rows: list[dict[str, Any]]) -> bytes:
+    return (json.dumps({"exported_at": now_text(), "count": len(rows), "items": rows}, ensure_ascii=False, indent=2) + "\n").encode("utf-8")
+
+
+def _export_csv(rows: list[dict[str, Any]]) -> bytes:
+    output = io.StringIO(newline="")
+    fields = ["notice_key", "notice_type", "title", "department", "published_text", "url", "content", "analysis", "brief", "attachments"]
+    writer = csv.DictWriter(output, fieldnames=fields, extrasaction="ignore")
+    writer.writeheader()
+    for row in rows:
+        item = dict(row)
+        item["analysis"] = json.dumps(item.get("analysis"), ensure_ascii=False)
+        item["brief"] = json.dumps(item.get("brief"), ensure_ascii=False)
+        item["attachments"] = json.dumps(item.get("attachments", []), ensure_ascii=False)
+        writer.writerow(item)
+    return output.getvalue().encode("utf-8-sig")
+
+
+def _export_markdown(rows: list[dict[str, Any]]) -> bytes:
+    parts = [f"# 学院通知导出\n\n导出时间：{now_text()}\n\n共 {len(rows)} 条。\n"]
+    for row in rows:
+        analysis = row.get("analysis") or {}
+        brief = row.get("brief") or {}
+        attachments = row.get("attachments") or []
+        parts.append(f"## {row.get('title') or '未命名通知'}\n")
+        parts.append(
+            f"- 通知键：`{row.get('notice_key', '')}`\n"
+            f"- 类型：{NOTICE_TYPES.get(row.get('notice_type', ''), row.get('notice_type', ''))}\n"
+            f"- 部门：{row.get('department') or '未标注'}\n"
+            f"- 发布时间：{row.get('published_text') or '未标注'}\n"
+            f"- 来源：{row.get('url') or '未标注'}\n"
+        )
+        if analysis:
+            parts.append(f"\n### 规则/智能分析\n\n- 分类：{', '.join(analysis.get('categories') or [])}\n- 建议：{analysis.get('advice') or '暂无建议'}\n")
+        if brief:
+            parts.append(f"\n### AI/Agent 纪要\n\n{brief.get('summary') or '暂无摘要'}\n")
+        if attachments:
+            parts.append("\n### 附件\n\n" + "\n".join(f"- [{item.get('name') or '附件'}]({item.get('url') or ''})（{item.get('status') or 'UNKNOWN'}）" for item in attachments) + "\n")
+        parts.append(f"\n### 正文\n\n{row.get('content') or ''}\n")
+    return "\n".join(parts).encode("utf-8")
+
+
+def export_notice_data(
+    store: NoticeStore,
+    export_format: str = "json",
+    notice_type: str = "",
+    category: str = "",
+    since: str = "",
+    until: str = "",
+    q: str = "",
+    limit: int = 500,
+) -> tuple[bytes, str, str]:
+    export_format = export_format.lower().strip()
+    if export_format not in {"json", "csv", "markdown", "zip"}:
+        raise ValueError("format 仅支持 json、csv、markdown、zip")
+    rows = _export_rows(store, notice_type, category, since, until, q, limit)
+    if export_format == "json":
+        return _export_json(rows), "application/json; charset=utf-8", "college-notices.json"
+    if export_format == "csv":
+        return _export_csv(rows), "text/csv; charset=utf-8", "college-notices.csv"
+    if export_format == "markdown":
+        return _export_markdown(rows), "text/markdown; charset=utf-8", "college-notices.md"
+    archive = io.BytesIO()
+    with zipfile.ZipFile(archive, "w", compression=zipfile.ZIP_DEFLATED) as bundle:
+        bundle.writestr("college-notices.json", _export_json(rows))
+        bundle.writestr("college-notices.csv", _export_csv(rows))
+        bundle.writestr("college-notices.md", _export_markdown(rows))
+    return archive.getvalue(), "application/zip", "college-notices.zip"
 
 
 def extract_downloaded_attachments() -> dict[str, Any]:
@@ -1056,7 +1198,7 @@ def perform_update(
         if max_items_per_type is not None and max_items_per_type < 1:
             raise ValueError("max_items_per_type 必须是正整数")
         for notice_type in config.get("notice_types", list(NOTICE_TYPES)):
-            if notice_type not in NOTICE_TYPES:
+            if notice_type not in LIST_PATHS:
                 continue
             items.extend(spider.fetch_list(notice_type, since=since, max_items=max_items_per_type))
             time.sleep(max(0.0, float(config.get("request_interval_seconds", 0.5))))
@@ -1344,13 +1486,23 @@ def render_home(
     q: str = "",
     since: str = "",
     until: str = "",
+    notice_type: str = "",
     category: str = "",
     limit: int = 20,
     page: int = 1,
 ) -> str:
     limit = max(1, min(int(limit), 200))
     page = max(1, int(page))
-    rows = store.list_notices(limit=limit, offset=(page - 1) * limit, category=category, since=since, until=until, q=q)
+    notice_type = notice_type if notice_type in NOTICE_TYPES else ""
+    rows = store.list_notices(
+        limit=limit,
+        offset=(page - 1) * limit,
+        notice_type=notice_type,
+        category=category,
+        since=since,
+        until=until,
+        q=q,
+    )
     unread = sum(1 for row in rows if row["is_unread"])
     category_counts: dict[str, int] = {}
     cards: list[str] = []
@@ -1374,14 +1526,14 @@ def render_home(
                 f"<p class='brief brief-preview'><strong>Agent纪要：</strong>{html.escape(str(brief['summary']))} "
                 f"<small>最近解析：{html.escape(str(brief.get('updated_at') or '未记录'))}</small></p>"
             )
-        notice_type = html.escape(NOTICE_TYPES.get(row["notice_type"], row["notice_type"]))
+        notice_type_label = html.escape(NOTICE_TYPES.get(row["notice_type"], row["notice_type"]))
         excerpt = re.sub(r"\s+", " ", str(row["content"] or "")).strip()
         if len(excerpt) > 180:
             excerpt = excerpt[:180].rstrip() + "…"
         cards.append(
             f"<article class='card {'unread' if row['is_unread'] else ''}' data-categories='{html.escape(category_data)}' "
             f"data-key='{notice_key_attr}' onclick=\"openDetail('{notice_key_attr}')\" onkeydown=\"(event.key==='Enter'||event.key===' ')&&openDetail('{notice_key_attr}')\" tabindex='0' role='button'>"
-            f"<div class='meta'>{notice_type} · {html.escape(row['published_text'] or row['first_seen_at'])} · {html.escape(row['department'] or '部门未标注')}</div>"
+            f"<div class='meta'>{notice_type_label} · {html.escape(row['published_text'] or row['first_seen_at'])} · {html.escape(row['department'] or '部门未标注')}</div>"
             f"<h2><a href='{html.escape(row['url'])}' target='_blank' rel='noreferrer' onclick='event.stopPropagation()'>{html.escape(row['title'])}</a></h2>"
             f"<div class='badges'>{badges or '<span class=\'badge muted\'>未分类</span>'}</div>"
             f"<p class='excerpt'>{html.escape(excerpt)}</p>"
@@ -1393,7 +1545,7 @@ def render_home(
             "</article>"
         )
     def page_url(target_page: int) -> str:
-        params = {"q": q, "since": since, "until": until, "category": category, "limit": str(limit), "page": str(target_page)}
+        params = {"q": q, "since": since, "until": until, "type": notice_type, "category": category, "limit": str(limit), "page": str(target_page)}
         return "/?" + urlencode({key: value for key, value in params.items() if value})
 
     pagination_parts = [f"<span class='page-current'>第 {page} 页</span>"]
@@ -1412,6 +1564,10 @@ def render_home(
         f"<option value='{html.escape(option_category)}'{selected_category_suffix if option_category == selected_category else ''}>{html.escape(CATEGORY_LABELS[option_category])}（{category_counts.get(option_category, 0)}）</option>"
         for option_category in CATEGORY_LABELS
     )
+    type_options = "".join(
+        f"<option value='{html.escape(option_type)}'{(' selected' if option_type == notice_type else '')}>{html.escape(label)}</option>"
+        for option_type, label in NOTICE_TYPES.items()
+    )
     query_value = html.escape(q, quote=True)
     since_value = html.escape(since, quote=True)
     until_value = html.escape(until, quote=True)
@@ -1429,9 +1585,9 @@ def render_home(
     <meta name='viewport' content='width=device-width,initial-scale=1'><title>学院通知查看器</title>
     <style>body{font-family:system-ui,-apple-system,"Microsoft YaHei",sans-serif;background:#f5f7fb;color:#202938;margin:0}.wrap{max-width:1100px;margin:auto;padding:24px}.toolbar,.filters{display:flex;gap:10px;align-items:center;flex-wrap:wrap}.toolbar button,.filters button{padding:8px 14px;border:0;border-radius:8px;background:#2563eb;color:white;cursor:pointer}.toolbar select,.filters select,.filters input{padding:8px;border:1px solid #cbd5e1;border-radius:8px;background:white}.filters{padding:14px;background:#eaf0f8;border-radius:10px}.filters input[type=text]{min-width:260px}.filters a{color:#2563eb;text-decoration:none}.hint{color:#64748b}.account-state{color:#475569;font-size:13px}.card{background:white;border-radius:12px;padding:18px;margin:16px 0;box-shadow:0 2px 12px #10204012;cursor:pointer}.card:focus{outline:3px solid #93c5fd}.card.unread{border-left:5px solid #2563eb}.meta{color:#64748b;font-size:13px}.card h2{font-size:20px;margin-bottom:8px}.card a{color:#172554;text-decoration:none}.excerpt{color:#475569;line-height:1.55;margin:8px 0}.card-actions{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-top:12px}.attachment-summary{color:#64748b;font-size:13px;margin-right:auto}.card button{border:1px solid #cbd5e1;background:white;border-radius:6px;padding:5px 10px;cursor:pointer}.badges,.detail-badges{display:flex;gap:6px;flex-wrap:wrap}.badge{display:inline-block;padding:3px 8px;border-radius:999px;background:#dbeafe;color:#1e40af;font-size:12px}.badge.muted{background:#e2e8f0;color:#475569}.advice{padding:10px 12px;background:#f0fdf4;border-left:3px solid #22c55e;line-height:1.6}.advice small{color:#64748b}.brief{padding:12px;background:#eff6ff;border-left:3px solid #3b82f6;line-height:1.6}.brief h3,.brief h4{margin:6px 0}.brief ul{margin-top:4px}.brief small{color:#64748b}.modal{display:none;position:fixed;inset:0;background:#0f172a99;z-index:10;align-items:center;justify-content:center;padding:16px}.modal.open{display:flex}.modal-card{background:white;border-radius:14px;width:min(900px,calc(100vw - 32px));max-height:90vh;overflow:auto;padding:22px;box-shadow:0 20px 60px #02061755}.config-card{width:min(560px,calc(100vw - 32px))}.config-card label{display:block;margin:12px 0 6px}.config-card input[type=text],.config-card input[type=password]{box-sizing:border-box;width:100%%;padding:9px;border:1px solid #cbd5e1;border-radius:8px}.config-actions{display:flex;gap:10px;flex-wrap:wrap;margin-top:16px}.modal-head{display:flex;gap:16px;align-items:flex-start;justify-content:space-between}.modal-head h2{margin:0;font-size:22px;line-height:1.4}.modal-close{border:0;background:#e2e8f0;border-radius:50%%;width:32px;height:32px;font-size:20px;cursor:pointer}.detail-meta{color:#64748b;font-size:13px;margin:10px 0}.detail-content{white-space:pre-wrap;line-height:1.75;background:#f8fafc;border-radius:8px;padding:16px;max-height:55vh;overflow:auto}.detail-attachments{padding-left:20px}.modal-source{display:inline-block;margin:12px 0;color:#2563eb}.modal-open{overflow:hidden}</style></head>
     <body><main class='wrap'><h1>学院通知查看器</h1>
-    <div class='toolbar'><button onclick='updateNow()'>立即更新</button><button onclick='readAll()'>全部标为已读</button><button onclick='openConfig()'>账号配置</button>
+    <div class='toolbar'><button onclick='updateNow()'>立即更新</button><button onclick='readAll()'>全部标为已读</button><button onclick='openConfig()'>账号配置</button><a href='/manage'>页面管理 / AI / 导出</a>
     <span id='accountState' class='account-state'>%s</span><span id='status'>匹配：%d 条；未读：%d；更新状态：%s</span></div>
-    <form class='filters' method='get' action='/'><input type='text' name='q' value='%s' placeholder='关键词/模糊搜索：标题、正文、部门、附件'><label>从 <input type='date' name='since' value='%s'></label><label>到 <input type='date' name='until' value='%s'></label><label>分类：<select name='category'><option value=''>全部</option>%s</select></label><label>显示：<select name='limit'>%s</select></label><button type='submit'>筛选</button><a href='/'>清除</a></form>
+    <form class='filters' method='get' action='/'><input type='text' name='q' value='%s' placeholder='关键词/模糊搜索：标题、正文、部门、附件'><label>从 <input type='date' name='since' value='%s'></label><label>到 <input type='date' name='until' value='%s'></label><label>来源：<select name='type'><option value=''>全部来源</option>%s</select></label><label>分类：<select name='category'><option value=''>全部</option>%s</select></label><label>显示：<select name='limit'>%s</select></label><button type='submit'>筛选</button><a href='/'>清除</a></form>
     <p class='hint'>本地运行 · 仅绑定 127.0.0.1 · 数据保存在 SQLite · 智能建议当前为本地规则分析，可由 Agent 覆盖</p>
     <section id='list'>%s</section></main>
     <div id='detailModal' class='modal' role='dialog' aria-modal='true' aria-labelledby='detailTitle' onclick='if(event.target===this)closeDetail()'>
@@ -1453,7 +1609,29 @@ def render_home(
     document.addEventListener('keydown',function(event){if(event.key==='Escape')closeDetail()})
     const originalRenderBrief=renderBrief;function renderAgentBrief(brief){if(!brief)return '<section class="brief"><h3>Agent纪要</h3><p>尚未生成 Agent 纪要；当前内容来自本地规则分析。</p><small>最近解析：暂无</small></section>';const base=originalRenderBrief(brief).replace('<h3>纪要</h3>','<h3>Agent纪要</h3>');const audience=(brief.audience||[]).map(x=>escapeHtml(x)).join('、');const evidence=(brief.evidence||[]).map(x=>'<li>'+escapeHtml(x)+'</li>').join('');const extra=(audience?'<p><strong>面向对象：</strong>'+audience+'</p>':'')+(evidence?'<h4>证据与待确认</h4><ul>'+evidence+'</ul>':'')+'<small>最近解析：'+escapeHtml(brief.updated_at||'未记录')+' · 模型：'+escapeHtml(brief.model||'未填写')+' · 置信度：'+escapeHtml(brief.confidence??'未记录')+'</small>';return base.replace('</section>',extra+'</section>')}renderBrief=renderAgentBrief;
     function renderAnalysisMeta(analysis){if(!analysis||!analysis.updated_at)return '';const labels={competition:'比赛竞赛',patent:'专利知识产权',employment:'就业招聘',scholarship:'奖助学金',exam:'考试课程',activity:'校园活动',safety:'安全与管理',personnel:'人事任免',publicity:'公示',other:'其他'};const keywords=(analysis.keywords||[]).map(x=>escapeHtml(x)).join('、');const categories=(analysis.categories||[]).map(x=>labels[x]||x).join('、');return '<section class="analysis-meta"><strong>规则/智能分析</strong><span>分类：'+escapeHtml(categories||'未分类')+'</span>'+(keywords?'<span>关键词：'+keywords+'</span>':'')+'<span>置信度：'+escapeHtml(analysis.confidence??'未记录')+'</span><span>最近更新：'+escapeHtml(analysis.updated_at)+'</span><span>来源：'+escapeHtml(analysis.source||'未记录')+'</span></section>'}const originalRenderDetail=renderDetail;renderDetail=function(row){let content=originalRenderDetail(row);const briefStart=content.indexOf('<section class="brief">');const adviceStart=content.indexOf('<p class="advice">');if(briefStart>=0&&adviceStart>=0&&briefStart<adviceStart){const briefEnd=content.indexOf('</section>',briefStart)+10;content=content.slice(0,briefStart)+content.slice(briefEnd,adviceStart)+content.slice(briefStart,briefEnd)+content.slice(adviceStart)}return renderAnalysisMeta(row.analysis||{})+content};
-    </script><div id='configModal' class='modal' role='dialog' aria-modal='true' aria-labelledby='configTitle' onclick='if(event.target===this)closeConfig()'><div class='modal-card config-card'><div class='modal-head'><h2 id='configTitle'>账号配置</h2><button class='modal-close' type='button' aria-label='关闭' onclick='closeConfig()'>×</button></div><p class='hint'>仅用于本机通知采集。密码不会回显，也不会通过状态接口返回。</p><form onsubmit='saveConfig(event)'><label for='configUsername'>学校账号</label><input id='configUsername' type='text' autocomplete='username' maxlength='100'><label for='configPassword'>密码</label><input id='configPassword' type='password' autocomplete='current-password' maxlength='200'><label><input id='configRemember' type='checkbox'> 保存到本机（写入 data/ui_credentials.json）</label><p id='configState' class='hint'>正在读取配置状态…</p><div class='config-actions'><button type='submit'>保存配置</button><button type='button' onclick='clearConfig()'>清除本机保存</button><button type='button' onclick='closeConfig()'>取消</button></div></form></div></div></body></html>""" % (account_state, len(rows), unread, "运行中" if status["running"] else "空闲", query_value, since_value, until_value, category_options, limit_options, "\n".join(cards) or "<p>没有符合条件的通知。</p>")
+    </script><div id='configModal' class='modal' role='dialog' aria-modal='true' aria-labelledby='configTitle' onclick='if(event.target===this)closeConfig()'><div class='modal-card config-card'><div class='modal-head'><h2 id='configTitle'>账号配置</h2><button class='modal-close' type='button' aria-label='关闭' onclick='closeConfig()'>×</button></div><p class='hint'>仅用于本机通知采集。密码不会回显，也不会通过状态接口返回。</p><form onsubmit='saveConfig(event)'><label for='configUsername'>学校账号</label><input id='configUsername' type='text' autocomplete='username' maxlength='100'><label for='configPassword'>密码</label><input id='configPassword' type='password' autocomplete='current-password' maxlength='200'><label><input id='configRemember' type='checkbox'> 保存到本机（写入 data/ui_credentials.json）</label><p id='configState' class='hint'>正在读取配置状态…</p><div class='config-actions'><button type='submit'>保存配置</button><button type='button' onclick='clearConfig()'>清除本机保存</button><button type='button' onclick='closeConfig()'>取消</button></div></form></div></div></body></html>""" % (account_state, len(rows), unread, "运行中" if status["running"] else "空闲", query_value, since_value, until_value, type_options, category_options, limit_options, "\n".join(cards) or "<p>没有符合条件的通知。</p>")
+
+
+def render_manage(store: NoticeStore, manager: UpdateManager, professional_manager: ProfessionalUpdateManager) -> str:
+    rows = store.list_notices(limit=500)
+    counts = {key: 0 for key in NOTICE_TYPES}
+    for row in rows:
+        if row["notice_type"] in counts:
+            counts[row["notice_type"]] += 1
+    ai_status = ai_config_status(manager.config)
+    professional_status = professional_config_status(manager.config)
+    source_links = " ".join(
+        f"<a class='pill' href='/?type={quote(key)}'>{html.escape(label)}（{counts[key]}）</a>"
+        for key, label in NOTICE_TYPES.items()
+    )
+    return f"""<!doctype html><html lang='zh-CN'><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'>
+    <title>页面显示管理</title><style>body{{font-family:system-ui,-apple-system,'Microsoft YaHei',sans-serif;background:#f5f7fb;color:#202938;margin:0}}.wrap{{max-width:1000px;margin:auto;padding:24px}}.card{{background:white;border-radius:14px;padding:20px;margin:16px 0;box-shadow:0 2px 12px #10204012}}.toolbar,.pills{{display:flex;gap:10px;align-items:center;flex-wrap:wrap}}a{{color:#2563eb}}.pill,button{{padding:8px 12px;border:1px solid #cbd5e1;border-radius:8px;background:white;text-decoration:none;cursor:pointer}}button.primary{{background:#2563eb;color:white;border-color:#2563eb}}.muted{{color:#64748b}}.status{{display:inline-block;padding:4px 8px;border-radius:999px;background:#e2e8f0}}code{{background:#f1f5f9;padding:2px 5px;border-radius:4px}}</style></head><body><main class='wrap'>
+    <div class='toolbar'><h1>页面显示管理</h1><a href='/'>返回通知看板</a></div>
+    <section class='card'><h2>来源显示</h2><p class='muted'>按页面来源查看和管理展示范围；专业模式采集的页面会单独标记。</p><div class='pills'><a class='pill' href='/'>全部（{len(rows)}）</a>{source_links}</div></section>
+    <section class='card'><h2>AI 解析</h2><p>状态：<span class='status'>{html.escape(str(ai_status.get('status') or 'UNKNOWN'))}</span>；自动解析：<span class='status'>{'开启' if ai_status.get('auto_brief') else '关闭'}</span></p><p class='muted'>默认只补齐没有纪要的页面；“全部重解析”会重新调用 API，可能产生费用。</p><div class='toolbar'><button class='primary' onclick='batchAI(false)'>解析未处理页面</button><button onclick='batchAI(true)'>全部重解析</button><span id='aiResult' class='muted'></span></div></section>
+    <section class='card'><h2>专业模式</h2><p>配置状态：<span class='status'>{html.escape(str(professional_status.get('status') or 'UNKNOWN'))}</span>；配置名称：<code>{html.escape(str(professional_status.get('profile_name') or 'default'))}</code></p><p class='muted'>{html.escape(str(professional_status.get('error') or '可在 API 或 config.local.json 中配置其他页面。'))}</p><div class='toolbar'><button class='primary' onclick='professionalUpdate()'>立即更新专业页面</button><a class='pill' href='/?type=professional'>只看专业页面</a><span id='professionalResult' class='muted'></span></div></section>
+    <section class='card'><h2>导出</h2><p class='muted'>导出当前数据库中的页面，不包含密码、Token 或本地附件路径。</p><div class='pills'><a class='pill' href='/api/export?format=json'>JSON</a><a class='pill' href='/api/export?format=csv'>CSV</a><a class='pill' href='/api/export?format=markdown'>Markdown</a><a class='pill' href='/api/export?format=zip'>ZIP（全部格式）</a></div></section>
+    </main><script>async function batchAI(force){{const target=document.querySelector('#aiResult');target.textContent='正在提交…';const response=await fetch('/api/notices/ai-brief-batch',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{force:force,limit:100}})}});const data=await response.json();target.textContent=response.ok?'完成：成功 '+(data.succeeded||0)+'，跳过 '+(data.skipped||0)+'，失败 '+(data.failed||0):(data.error||'提交失败')}}async function professionalUpdate(){{const target=document.querySelector('#professionalResult');target.textContent='正在提交…';const response=await fetch('/api/professional/update',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:'{{"notify":true}}'}});const data=await response.json();target.textContent=response.ok?'已提交专业模式更新任务':(data.error||'提交失败')}}</script></body></html>"""
 
 
 class RequestHandler(BaseHTTPRequestHandler):
@@ -1472,6 +1650,14 @@ class RequestHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def send_download(self, body: bytes, content_type: str, filename: str) -> None:
+        self.send_response(200)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Disposition", f"attachment; filename*=UTF-8''{quote(filename)}")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
     def is_local_request(self) -> bool:
         return self.client_address[0] in {"127.0.0.1", "::1", "localhost"}
 
@@ -1486,10 +1672,40 @@ class RequestHandler(BaseHTTPRequestHandler):
 
     def do_GET(self) -> None:
         parsed = urlparse(self.path)
+        if parsed.path == "/manage":
+            body = render_manage(self.store, self.manager, self.professional_manager).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
+        if parsed.path == "/api/export":
+            if not self.is_local_request():
+                self.send_json({"error": "导出只允许本机访问"}, 403)
+                return
+            query = parse_qs(parsed.query)
+            try:
+                body, content_type, filename = export_notice_data(
+                    self.store,
+                    export_format=query.get("format", ["json"])[0],
+                    notice_type=query.get("type", [""])[0].strip(),
+                    category=query.get("category", [""])[0].strip(),
+                    since=normalize_date_bound(query.get("since", [""])[0], "since"),
+                    until=normalize_date_bound(query.get("until", [""])[0], "until"),
+                    q=query.get("q", [""])[0].strip(),
+                    limit=int(query.get("limit", ["500"])[0]),
+                )
+            except (TypeError, ValueError) as exc:
+                self.send_json({"error": str(exc)}, 400)
+                return
+            self.send_download(body, content_type, filename)
+            return
         if parsed.path == "/":
             query = parse_qs(parsed.query)
             q = query.get("q", [""])[0].strip()
             category = query.get("category", [""])[0].strip()
+            notice_type = query.get("type", [""])[0].strip()
             since = query.get("since", [""])[0].strip()
             until = query.get("until", [""])[0].strip()
             try:
@@ -1508,6 +1724,7 @@ class RequestHandler(BaseHTTPRequestHandler):
                 q=q,
                 since=since,
                 until=until,
+                notice_type=notice_type,
                 category=category,
                 limit=limit,
                 page=page,
@@ -1556,6 +1773,7 @@ class RequestHandler(BaseHTTPRequestHandler):
                 self.send_json({"error": "page must be an integer"}, 400)
                 return
             category = query.get("category", [""])[0].strip()
+            notice_type = query.get("type", [""])[0].strip()
             since = query.get("since", [""])[0].strip()
             until = query.get("until", [""])[0].strip()
             q = query.get("q", [""])[0].strip()
@@ -1571,6 +1789,7 @@ class RequestHandler(BaseHTTPRequestHandler):
                         unread=unread,
                         limit=limit,
                         offset=(page - 1) * max(1, limit),
+                notice_type=notice_type,
                         category=category,
                         since=since,
                         until=until,
@@ -1592,6 +1811,28 @@ class RequestHandler(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:
         parsed = urlparse(self.path)
+        if parsed.path == "/api/notices/ai-brief-batch":
+            if not self.is_local_request():
+                self.send_json({"error": "批量 AI 解读只允许本机访问"}, 403)
+                return
+            payload = self.read_json_body(20000)
+            try:
+                result = generate_ai_briefs_for_notices(
+                    self.manager.config,
+                    self.store,
+                    notice_type=str(payload.get("type") or "").strip(),
+                    category=str(payload.get("category") or "").strip(),
+                    since=normalize_date_bound(str(payload.get("since") or ""), "since"),
+                    until=normalize_date_bound(str(payload.get("until") or ""), "until"),
+                    q=str(payload.get("q") or "").strip(),
+                    limit=int(payload.get("limit") or 100),
+                    force=bool(payload.get("force")),
+                )
+            except (TypeError, ValueError) as exc:
+                self.send_json({"error": str(exc)}, 400)
+                return
+            self.send_json(result, 200 if result.get("status") != "FAILED" else 502)
+            return
         if parsed.path == "/api/professional/config":
             if not self.is_local_request():
                 self.send_json({"error": "专业模式配置只允许本机访问"}, 403)
@@ -1787,6 +2028,15 @@ def main() -> int:
     sub.add_parser("serve", help="启动本地查看页面和 HTTP API")
     sub.add_parser("analyze", help="对数据库中的现有通知重新生成分类和建议")
     sub.add_parser("export", help="为现有通知生成原文快照和纪要 Markdown")
+    export_data = sub.add_parser("export-data", help="导出通知数据为 JSON、CSV、Markdown 或 ZIP")
+    export_data.add_argument("--format", choices=("json", "csv", "markdown", "zip"), default="json")
+    export_data.add_argument("--output", help="输出文件路径，默认写入 data/exports/")
+    export_data.add_argument("--type", dest="notice_type", default="", choices=("", *NOTICE_TYPES.keys()))
+    export_data.add_argument("--category", default="")
+    export_data.add_argument("--since", default="")
+    export_data.add_argument("--until", default="")
+    export_data.add_argument("--q", default="")
+    export_data.add_argument("--limit", type=int, default=500)
     sub.add_parser("extract-attachments", help="提取已下载附件的文本，记录不支持的格式")
     sub.add_parser("check-config", help="检查账号和本地配置是否齐全，不执行登录")
     sub.add_parser("ai-status", help="检查 AI 配置状态，不返回 API Key")
@@ -1795,6 +2045,14 @@ def main() -> int:
     professional_update.add_argument("--notify", action="store_true", help="有新增时打印提醒并按配置尝试桌面提醒")
     professional_update.add_argument("--json", action="store_true", help="只输出 JSON 摘要")
     sub.add_parser("professional-login-test", help="测试专业模式登录会话，不采集页面")
+    ai_brief_all = sub.add_parser("ai-brief-all", help="批量补齐或重新生成页面 AI 解读")
+    ai_brief_all.add_argument("--force", action="store_true", help="忽略已有纪要，全部重新生成")
+    ai_brief_all.add_argument("--type", dest="notice_type", default="", choices=("", *NOTICE_TYPES.keys()))
+    ai_brief_all.add_argument("--category", default="")
+    ai_brief_all.add_argument("--since", default="")
+    ai_brief_all.add_argument("--until", default="")
+    ai_brief_all.add_argument("--q", default="")
+    ai_brief_all.add_argument("--limit", type=int, default=100)
     ai_brief = sub.add_parser("ai-brief", help="为一条通知调用 AI 生成分析和纪要")
     ai_brief.add_argument("notice_key", help="通知键，例如 notice:10108")
     notify = sub.add_parser("notify", help="输出当前未读通知")
@@ -1842,12 +2100,50 @@ def main() -> int:
         print(json.dumps(result, ensure_ascii=False, indent=None if args.json else 2))
         return 0 if result["status"] != "FAILED" else 1
     store = NoticeStore()
+    if args.command == "ai-brief-all":
+        result = generate_ai_briefs_for_notices(
+            config,
+            store,
+            notice_type=args.notice_type,
+            category=args.category,
+            since=normalize_date_bound(args.since, "since"),
+            until=normalize_date_bound(args.until, "until"),
+            q=args.q,
+            limit=args.limit,
+            force=args.force,
+        )
+        print(json.dumps(result, ensure_ascii=False, indent=2))
+        return 0 if result["status"] != "FAILED" else 1
     if args.command == "analyze":
         result = analyze_existing_notices()
         print(json.dumps(result, ensure_ascii=False))
         return 0
     if args.command == "export":
         print(json.dumps(export_existing_artifacts(), ensure_ascii=False))
+        return 0
+    if args.command == "export-data":
+        try:
+            since = normalize_date_bound(args.since, "since")
+            until = normalize_date_bound(args.until, "until")
+            body, _, filename = export_notice_data(
+                store,
+                export_format=args.format,
+                notice_type=args.notice_type,
+                category=args.category,
+                since=since,
+                until=until,
+                q=args.q,
+                limit=args.limit,
+            )
+            target = Path(args.output) if args.output else DATA_DIR / "exports" / filename
+            if not target.is_absolute():
+                target = BASE_DIR / target
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(body)
+            print(json.dumps({"status": "SUCCESS", "format": args.format, "path": str(target), "bytes": len(body)}, ensure_ascii=False))
+        except (TypeError, ValueError, OSError) as exc:
+            print(json.dumps({"status": "FAILED", "error": str(exc)}, ensure_ascii=False))
+            return 1
         return 0
     if args.command == "extract-attachments":
         print(json.dumps(extract_downloaded_attachments(), ensure_ascii=False))

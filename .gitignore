@@ -9,6 +9,7 @@ data/*.log
 data/originals/
 data/summaries/
 data/extracted/
+data/exports/
 attachments/*
 !attachments/.gitkeep
 output/
