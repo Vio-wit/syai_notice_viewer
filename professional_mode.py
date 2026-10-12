@@ -979,7 +979,12 @@ class ProfessionalCrawler:
                     if not current["discovery_only"] and _in_date_range(
                         page["published_text"], self.profile["output"]["published_from"], self.profile["output"]["published_to"]
                     ):
-                        attachments = extract_attachments(document, response.url, self.profile, self.session)
+                        attachments = extract_attachments(
+                            document if isinstance(document, BeautifulSoup) else None,
+                            response.url,
+                            self.profile,
+                            self.session,
+                        )
                         item = self._item_from_page(response.url, page, attachments)
                         created, changed, attachment_count = item_handler(item, self)
                         summary.created += int(created)
