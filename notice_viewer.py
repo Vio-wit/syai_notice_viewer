@@ -31,6 +31,7 @@ import requests
 from bs4 import BeautifulSoup
 from document_pipeline import EXTRACTED_DIR, extract_text, write_notice_artifacts
 from notice_analysis import CATEGORY_LABELS, analyze_notice, normalize_agent_analysis, normalize_agent_brief
+from notice_ai import DEFAULT_AI_CONFIG, NoticeAIClient, NoticeAIError, ai_config_status, save_ai_config
 
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -61,6 +62,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "bind_host": "127.0.0.1",
     "port": 8765,
     "notifications": {"enabled": True, "desktop": False},
+    "ai": dict(DEFAULT_AI_CONFIG),
 }
 
 HEADERS = {
@@ -88,9 +90,13 @@ def now_text() -> str:
 def merge_config(raw: dict[str, Any]) -> dict[str, Any]:
     result = dict(DEFAULT_CONFIG)
     result["notifications"] = dict(DEFAULT_CONFIG["notifications"])
+    # 保留 AI 配置的“未设置”状态，让被忽略的 ui_ai_config.json 能在重启后生效。
+    result["ai"] = {}
     result.update(raw)
     if isinstance(raw.get("notifications"), dict):
         result["notifications"].update(raw["notifications"])
+    if isinstance(raw.get("ai"), dict):
+        result["ai"].update(raw["ai"])
     return result
 
 
@@ -957,6 +963,27 @@ def refresh_notice_artifacts(store: NoticeStore, key: str) -> None:
         logging.getLogger("notice_viewer").warning("写入原文/纪要文件失败 key=%s: %s", key, exc)
 
 
+def generate_ai_brief_for_notice(
+    config: dict[str, Any],
+    key: str,
+    store: NoticeStore | None = None,
+) -> dict[str, Any]:
+    """为单条通知生成 AI 分析和纪要，并写回 SQLite/Markdown。"""
+
+    target_store = store or NoticeStore()
+    detail = target_store.get_notice_detail(key)
+    if detail is None:
+        raise KeyError(f"通知不存在: {key}")
+    client = NoticeAIClient(config)
+    generated = client.generate(detail)
+    analysis = normalize_agent_analysis(generated.get("analysis") or {})
+    brief = normalize_agent_brief(generated.get("brief") or {})
+    target_store.save_analysis(key, analysis)
+    target_store.save_brief(key, brief)
+    refresh_notice_artifacts(target_store, key)
+    return {"notice_key": key, "analysis": analysis, "brief": brief, "model": generated.get("model", "")}
+
+
 def export_existing_artifacts() -> dict[str, Any]:
     store = NoticeStore()
     rows = store.list_notices(limit=500)
@@ -998,6 +1025,18 @@ def perform_update(
     unchanged_count = 0
     failed_count = 0
     new_items: list[dict[str, Any]] = []
+    ai_client = NoticeAIClient(config)
+    ai_summary: dict[str, Any] = {
+        "auto_brief": ai_client.auto_brief,
+        "ready": ai_client.ready,
+        "attempted": 0,
+        "succeeded": 0,
+        "failed": 0,
+        "skipped": 0,
+        "errors": [],
+    }
+    if ai_client.auto_brief and not ai_client.ready:
+        ai_summary["skipped_reason"] = "未配置或未启用 AI"
     try:
         since = normalize_date_bound(since or config.get("collection_start_date"), "since")
         until = normalize_date_bound(until, "until")
@@ -1047,6 +1086,17 @@ def perform_update(
                     for attachment in detail.get("attachments", []):
                         spider.download(key, attachment, store)
                         time.sleep(max(0.0, float(config.get("request_interval_seconds", 0.5))))
+                if (was_created or was_changed) and ai_client.auto_brief:
+                    if not ai_client.ready:
+                        ai_summary["skipped"] += 1
+                    else:
+                        ai_summary["attempted"] += 1
+                        try:
+                            generate_ai_brief_for_notice(config, key, store)
+                            ai_summary["succeeded"] += 1
+                        except Exception as exc:
+                            ai_summary["failed"] += 1
+                            ai_summary["errors"].append({"notice_key": key, "error": str(exc)[:500]})
                 refresh_notice_artifacts(store, key)
             except Exception as exc:
                 failed_count += 1
@@ -1069,6 +1119,7 @@ def perform_update(
             "unchanged": unchanged_count,
             "failed": failed_count,
             "new_notice_keys": [notice_key(item) for item in new_items],
+            "ai": ai_summary,
         }
         store.finish_run(run_id, result["status"], created_count, changed_count, failed_count)
         (DATA_DIR / "last_update.json").write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -1336,6 +1387,12 @@ class RequestHandler(BaseHTTPRequestHandler):
                 return
             self.send_json(credential_status(self.manager.config))
             return
+        if parsed.path == "/api/config/ai/status":
+            if not self.is_local_request():
+                self.send_json({"error": "AI 配置只允许本机访问"}, 403)
+                return
+            self.send_json(ai_config_status(self.manager.config))
+            return
         if parsed.path == "/api/notices":
             query = parse_qs(parsed.query)
             unread = query.get("unread", ["0"])[0] == "1"
@@ -1386,6 +1443,18 @@ class RequestHandler(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:
         parsed = urlparse(self.path)
+        if parsed.path == "/api/config/ai":
+            if not self.is_local_request():
+                self.send_json({"error": "AI 配置只允许本机访问"}, 403)
+                return
+            payload = self.read_json_body(20000)
+            try:
+                status = save_ai_config(self.manager.config, payload)
+            except ValueError as exc:
+                self.send_json({"error": str(exc)}, 400)
+                return
+            self.send_json({"ok": True, "status": status})
+            return
         if parsed.path == "/api/config/credentials":
             if not self.is_local_request():
                 self.send_json({"error": "账号配置只允许本机访问"}, 403)
@@ -1447,6 +1516,25 @@ class RequestHandler(BaseHTTPRequestHandler):
             key = unquote(parsed.path[len(prefix):-len("/read")])
             self.store.mark_read(key)
             self.send_json({"ok": True, "notice_key": key})
+            return
+        if parsed.path.startswith(prefix) and parsed.path.endswith("/ai-brief"):
+            if not self.is_local_request():
+                self.send_json({"error": "AI 解读只允许本机访问"}, 403)
+                return
+            key = unquote(parsed.path[len(prefix):-len("/ai-brief")])
+            try:
+                result = generate_ai_brief_for_notice(self.manager.config, key, self.store)
+            except KeyError:
+                self.send_json({"error": "notice not found", "notice_key": key}, 404)
+                return
+            except NoticeAIError as exc:
+                self.send_json({"error": str(exc), "notice_key": key}, 502)
+                return
+            except Exception as exc:
+                logging.getLogger("notice_viewer.http").exception("AI 解读失败 key=%s", key)
+                self.send_json({"error": str(exc)[:500], "notice_key": key}, 500)
+                return
+            self.send_json({"ok": True, **result})
             return
         if parsed.path.startswith(prefix) and parsed.path.endswith("/analysis"):
             key = unquote(parsed.path[len(prefix):-len("/analysis")])
@@ -1513,6 +1601,9 @@ def main() -> int:
     sub.add_parser("export", help="为现有通知生成原文快照和纪要 Markdown")
     sub.add_parser("extract-attachments", help="提取已下载附件的文本，记录不支持的格式")
     sub.add_parser("check-config", help="检查账号和本地配置是否齐全，不执行登录")
+    sub.add_parser("ai-status", help="检查 AI 配置状态，不返回 API Key")
+    ai_brief = sub.add_parser("ai-brief", help="为一条通知调用 AI 生成分析和纪要")
+    ai_brief.add_argument("notice_key", help="通知键，例如 notice:10108")
     notify = sub.add_parser("notify", help="输出当前未读通知")
     notify.add_argument("--desktop", action="store_true", help="尝试 Windows 桌面提醒")
     read_all = sub.add_parser("read-all", help="把全部通知标为已读")
@@ -1536,6 +1627,9 @@ def main() -> int:
     if args.command == "serve":
         run_server(config)
         return 0
+    if args.command == "ai-status":
+        print(json.dumps(ai_config_status(config), ensure_ascii=False))
+        return 0
     store = NoticeStore()
     if args.command == "analyze":
         result = analyze_existing_notices()
@@ -1546,6 +1640,14 @@ def main() -> int:
         return 0
     if args.command == "extract-attachments":
         print(json.dumps(extract_downloaded_attachments(), ensure_ascii=False))
+        return 0
+    if args.command == "ai-brief":
+        try:
+            result = generate_ai_brief_for_notice(config, args.notice_key, store)
+        except (KeyError, NoticeAIError, ValueError) as exc:
+            print(json.dumps({"status": "FAILED", "error": str(exc)}, ensure_ascii=False))
+            return 1
+        print(json.dumps({"status": "SUCCESS", **result}, ensure_ascii=False))
         return 0
     if args.command == "notify":
         items = store.list_notices(unread=True)

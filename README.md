@@ -5,6 +5,7 @@
 - Python + SQLite + 本地网页；不依赖 Spring、MySQL、MinIO 或 RagFlow。
 - 复用项目里已经验证过的学院通知登录、列表接口和附件下载思路。
 - 支持手动更新、Agent 命令行触发、HTTP API 触发、增量去重和未读提醒。
+- 可选配置 OpenAI 兼容 API，对新增或内容变化的通知自动生成分类建议和结构化纪要；没有 Key 时仍使用本地规则。
 - 默认只监听 `127.0.0.1`，不会对局域网开放。
 
 ## 当前账号来源
@@ -63,6 +64,54 @@ $env:NOTICE_VIEWER_CONFIG = 'C:\\Users\\你的用户名\\.notice-viewer\\config.
 运行 `check-config` 只会显示脱敏账号、配置来源和是否已配置密码，不会执行登录，也不会打印密码。它只能检查配置完整性，不能证明学校账号当前有效。
 
 当前项目仍是单机个人看板：不同使用者应各自运行自己的实例。若要让多人共用一个服务器，需要另行增加应用登录、用户隔离、加密凭据存储和权限控制，不能直接把 `bind_host` 改成局域网地址。
+
+## 可选 AI 解读
+
+AI 功能使用 OpenAI 兼容的 `POST /chat/completions` 接口。项目不会内置 API Key；每个人都应使用自己的 Key、模型和服务地址。没有配置或没有启用时，不会发起外部模型请求。
+
+推荐用环境变量配置，不会写入项目文件：
+
+```powershell
+$env:NOTICE_AI_API_KEY = '本人的 API Key'
+$env:NOTICE_AI_BASE_URL = 'https://api.openai.com/v1'
+$env:NOTICE_AI_MODEL = 'gpt-4o-mini'
+$env:NOTICE_AI_ENABLED = '1'
+$env:NOTICE_AI_AUTO_BRIEF = '1'
+```
+
+也可以写入个人的 `config.local.json`（该文件已被 `.gitignore` 忽略）：
+
+```json
+{
+  "ai": {
+    "enabled": true,
+    "auto_brief": true,
+    "base_url": "https://api.openai.com/v1",
+    "model": "gpt-4o-mini",
+    "api_key": "本人的 API Key"
+  }
+}
+```
+
+启动后可以用本机 API 配置，API Key 只会写入被忽略的 `data/ui_ai_config.json`，状态接口只返回是否已配置，不返回 Key：
+
+```powershell
+.\.venv\Scripts\python.exe notice_viewer.py ai-status
+Invoke-RestMethod http://127.0.0.1:8765/api/config/ai/status
+Invoke-RestMethod -Method Post `
+  -Uri http://127.0.0.1:8765/api/config/ai `
+  -ContentType 'application/json' `
+  -Body '{"enabled":true,"auto_brief":true,"base_url":"https://api.openai.com/v1","model":"gpt-4o-mini","api_key":"本人的 API Key","remember":true}'
+```
+
+开启 `auto_brief` 后，`update` 只会对新增或正文变化的通知调用一次 AI，并写回 `notice_analysis`、`notice_briefs` 和 `data/summaries/`。模型只接收通知正文以及已经提取出的附件文本；无法确认的内容必须标记为 `partial` 或 `needs_ocr`。也可以只解读一条通知：
+
+```powershell
+.\.venv\Scripts\python.exe notice_viewer.py ai-brief notice:10108
+Invoke-RestMethod -Method Post http://127.0.0.1:8765/api/notices/notice%3A10108/ai-brief
+```
+
+AI 配置和单条解读 API 仅允许本机访问。其他 Agent 仍可以按原协议直接 POST `/api/notices/{notice_key}/analysis` 和 `/api/notices/{notice_key}/brief`，不依赖外部 AI。
 
 ## 安装与运行
 
@@ -143,7 +192,7 @@ http://127.0.0.1:8765/?q=比赛&since=2026-08-31&until=2026-09-27&category=compe
 
 重复采集时，通知按“来源类型 + 源站 ID”去重；没有源站 ID 的发文按规范化 URL 生成稳定键。附件按“通知 + 附件 URL”去重。重复运行不会新增重复记录，结果中的 `created`、`changed`、`unchanged` 分别表示新增、内容变化和已存在且未变化的数量。
 
-采集不会自动生成或覆盖 Agent 纪要：`update` 只处理通知、附件和规则分类（`notice_analysis`，`source` 为 `rules-v1`），已写回的 `notice_briefs` 和 `data/summaries/` 保持原样。新增的 `created` 和内容变化的 `changed` 通知需要 Agent 重新通过 `/api/notices/{notice_key}/analysis` 与 `/api/notices/{notice_key}/brief` 写回，否则详情页会显示“尚未生成 Agent 纪要”，或继续显示基于旧正文的纪要。
+默认情况下，采集不会自动生成或覆盖 Agent 纪要：`update` 只处理通知、附件和规则分类（`notice_analysis`，`source` 为 `rules-v1`），已写回的 `notice_briefs` 和 `data/summaries/` 保持原样。开启 `ai.auto_brief` 且配置有效 Key 后，`update` 会自动处理新增的 `created` 和内容变化的 `changed` 通知；AI 失败时不会让采集失败，并会在结果中的 `ai.errors` 报告。没有 AI 配置时，仍可由其他 Agent 通过 `/api/notices/{notice_key}/analysis` 与 `/api/notices/{notice_key}/brief` 写回。
 
 生成原文快照和纪要（已有 Agent 纪要时生成 Agent 版，否则生成规则版）：
 
@@ -174,6 +223,7 @@ http://127.0.0.1:8765/?q=比赛&since=2026-08-31&until=2026-09-27&category=compe
 ```text
 notice_viewer.py       抓取、SQLite、HTTP API 和本地页面
 notice_analysis.py     本地规则分类、截止时间提示和行动建议
+notice_ai.py           可选 OpenAI 兼容 API、AI 分析和结构化纪要
 document_pipeline.py   原文快照、纪要文件和多格式附件文本提取
 NOTICE_AGENT_PROTOCOL.md 其他 Agent 使用的采集与分析规范
 agent_specs/           附件解读 Agent 规范和 JSON Schema

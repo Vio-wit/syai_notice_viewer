@@ -159,6 +159,8 @@ Agent 纪要写回后，网页详情会显示 `updated_at` 对应的最近解析
 写回要求：
 
 - `update` 不会生成、也不会覆盖 `notice_briefs`；采集后必须对结果里的 `new_notice_keys` 和 `changed` 对应的 key 重新生成纪要并写回，否则新通知没有纪要、内容变化的通知仍是旧纪要。
+- 如果个人实例配置了 `ai.enabled=true`、`ai.auto_brief=true` 和自己的 OpenAI 兼容 API Key，`update` 会自动对这些 key 调用 AI 并写回分析、纪要和 Markdown；AI 调用失败不应阻断采集，需查看结果中的 `ai.errors`。
+- AI 配置接口 `GET /api/config/ai/status`、`POST /api/config/ai` 和单条解读接口 `POST /api/notices/{notice_key}/ai-brief` 仅允许本机访问，API Key 不得写入 Git 跟踪文件。
 - `source` 使用 `agent:<名称>`，规则分析使用 `rules-v1`。
 - 建议必须是可执行动作，不要只写“值得关注”。
 - `confidence` 范围为 `0` 到 `1`。

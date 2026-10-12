@@ -2,6 +2,7 @@ import unittest
 import zipfile
 import json
 import os
+import notice_ai
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from types import SimpleNamespace
@@ -9,11 +10,13 @@ from unittest.mock import patch
 
 from document_pipeline import extract_text
 from notice_analysis import analyze_notice, normalize_agent_analysis, normalize_agent_brief
+from notice_ai import NoticeAIClient, ai_config_status, parse_json_output
 from notice_viewer import (
     DEFAULT_CONFIG,
     NoticeSpider,
     NoticeStore,
     credential_status,
+    generate_ai_brief_for_notice,
     in_date_range,
     normalize_date,
     parse_detail_html,
@@ -150,6 +153,128 @@ class NoticeViewerTests(unittest.TestCase):
             self.assertEqual(result["username_source"], "credentials_file")
             self.assertTrue(result["password_configured"])
             self.assertNotIn("secret-value", json.dumps(result))
+
+    def test_ai_config_status_masks_api_key(self):
+        with patch.dict(
+            os.environ,
+            {
+                "NOTICE_AI_API_KEY": "secret-api-key",
+                "OPENAI_API_KEY": "",
+                "NOTICE_AI_ENABLED": "1",
+                "NOTICE_AI_AUTO_BRIEF": "true",
+                "NOTICE_AI_MODEL": "test-model",
+            },
+            clear=False,
+        ):
+            result = ai_config_status({"ai": {}})
+
+        self.assertEqual(result["status"], "READY")
+        self.assertTrue(result["auto_brief"])
+        self.assertTrue(result["api_key_configured"])
+        self.assertNotIn("secret-api-key", json.dumps(result))
+
+    def test_ai_config_can_load_ignored_persisted_settings(self):
+        with TemporaryDirectory() as temp_dir:
+            persisted_path = Path(temp_dir) / "ui_ai_config.json"
+            persisted_path.write_text(
+                json.dumps(
+                    {
+                        "enabled": True,
+                        "auto_brief": True,
+                        "api_key": "persisted-secret",
+                        "base_url": "https://example.test/v1",
+                        "model": "persisted-model",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            with patch.object(notice_ai, "UI_AI_CONFIG_PATH", persisted_path), patch.dict(
+                os.environ,
+                {"NOTICE_AI_API_KEY": "", "OPENAI_API_KEY": "", "NOTICE_AI_ENABLED": "", "NOTICE_AI_AUTO_BRIEF": ""},
+                clear=False,
+            ):
+                result = ai_config_status({})
+
+        self.assertEqual(result["status"], "READY")
+        self.assertEqual(result["model"], "persisted-model")
+        self.assertNotIn("persisted-secret", json.dumps(result))
+
+    def test_ai_output_parser_accepts_json_code_fence(self):
+        result = parse_json_output('```json\n{"brief": {"summary": "测试"}}\n```')
+        self.assertEqual(result["brief"]["summary"], "测试")
+
+    def test_ai_client_uses_chat_completion_and_returns_structured_result(self):
+        class FakeResponse:
+            def raise_for_status(self):
+                return None
+
+            def json(self):
+                return {
+                    "model": "test-model",
+                    "choices": [
+                        {
+                            "message": {
+                                "content": json.dumps(
+                                    {
+                                        "analysis": {"categories": ["competition"], "advice": "按时报名"},
+                                        "brief": {"summary": "测试通知", "status": "complete"},
+                                    },
+                                    ensure_ascii=False,
+                                )
+                            }
+                        }
+                    ],
+                }
+
+        config = {
+            "ai": {
+                "enabled": True,
+                "auto_brief": True,
+                "api_key": "secret-api-key",
+                "base_url": "https://example.test/v1",
+                "model": "test-model",
+            }
+        }
+        with patch("notice_ai.requests.post", return_value=FakeResponse()) as request:
+            result = NoticeAIClient(config).generate(
+                {"notice_key": "notice:1", "title": "测试通知", "content": "测试正文", "attachments": []}
+            )
+
+        request.assert_called_once()
+        self.assertEqual(request.call_args.args[0], "https://example.test/v1/chat/completions")
+        self.assertEqual(result["brief"]["summary"], "测试通知")
+        self.assertTrue(result["brief"]["source"].startswith("agent:ai:"))
+
+    def test_generate_ai_brief_writes_analysis_and_brief(self):
+        item = {
+            "id": "88",
+            "type": "notice",
+            "title": "AI 测试通知",
+            "department": "测试部门",
+            "date": "2026/10/01",
+            "published_text": "2026/10/01",
+            "published_at": "2026-10-01",
+            "url": "http://example.test/uc/notice/88/entity",
+            "content": "请在截止日期前提交材料。",
+            "attachments": [],
+        }
+        with TemporaryDirectory() as temp_dir:
+            store = NoticeStore(Path(temp_dir) / "notices.sqlite3")
+            store.upsert(item)
+            with patch("notice_viewer.NoticeAIClient") as client_class, patch(
+                "notice_viewer.refresh_notice_artifacts"
+            ):
+                client_class.return_value.generate.return_value = {
+                    "analysis": {"categories": ["competition"], "advice": "按时提交"},
+                    "brief": {"summary": "测试摘要", "status": "complete", "model": "mock"},
+                    "model": "mock",
+                }
+                result = generate_ai_brief_for_notice({"ai": {}}, "notice:88", store)
+
+            self.assertEqual(result["brief"]["summary"], "测试摘要")
+            detail = store.get_notice_detail("notice:88")
+            self.assertEqual(detail["analysis"]["primary_category"], "competition")
+            self.assertEqual(detail["brief"]["source"], "agent:unknown")
 
     def test_store_deduplicates_and_supports_fuzzy_search(self):
         item = {

@@ -15,5 +15,15 @@
   "notifications": {
     "enabled": true,
     "desktop": false
+  },
+  "ai": {
+    "enabled": false,
+    "auto_brief": false,
+    "base_url": "https://api.openai.com/v1",
+    "model": "gpt-4o-mini",
+    "api_key": "",
+    "timeout_seconds": 90,
+    "max_tokens": 2400,
+    "max_input_chars": 40000
   }
 }
