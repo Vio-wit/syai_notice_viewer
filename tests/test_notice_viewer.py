@@ -2,6 +2,7 @@ import unittest
 import zipfile
 import json
 import os
+import requests
 import notice_ai
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -11,6 +12,7 @@ from unittest.mock import patch
 from document_pipeline import extract_text
 from notice_analysis import analyze_notice, normalize_agent_analysis, normalize_agent_brief
 from notice_ai import NoticeAIClient, ai_config_status, parse_json_output
+from professional_mode import extract_page, normalize_professional_config, professional_config_status, validate_professional_config
 from notice_viewer import (
     DEFAULT_CONFIG,
     NoticeSpider,
@@ -25,6 +27,58 @@ from notice_viewer import (
 
 
 class NoticeViewerTests(unittest.TestCase):
+    def test_professional_config_masks_secrets(self):
+        config = {
+            "professional": {
+                "enabled": False,
+                "site_url": "https://example.edu",
+                "entry_url": "https://example.edu/news",
+                "auth": {
+                    "type": "FORM_PASSWORD",
+                    "login_url": "https://example.edu/login",
+                    "username": "student-001",
+                    "password": "dont-print-this",
+                },
+            }
+        }
+        profile = validate_professional_config(normalize_professional_config(config["professional"]))
+        self.assertEqual(profile["allowed_domains"], ["example.edu"])
+        with TemporaryDirectory() as temp_dir, patch("professional_mode.PROFESSIONAL_CONFIG_PATH", Path(temp_dir) / "professional.json"):
+            status = professional_config_status(config)
+        serialized = json.dumps(status, ensure_ascii=False)
+        self.assertEqual(status["status"], "DISABLED")
+        self.assertNotIn("dont-print-this", serialized)
+        self.assertNotIn("student-001", serialized)
+
+    def test_professional_html_extraction(self):
+        profile = normalize_professional_config(
+            {
+                "site_url": "https://example.edu",
+                "entry_url": "https://example.edu/news",
+                "parser": {
+                    "title_selector": "h1",
+                    "published_selector": ".date",
+                    "department_selector": ".department",
+                    "content_selector": "article",
+                },
+            }
+        )
+        response = requests.Response()
+        response.url = "https://example.edu/news/1"
+        response.status_code = 200
+        response._content = """
+        <html><body><nav>不要保存</nav><article>
+          <h1>学院比赛通知</h1><span class='date'>发布时间：2026-10-01</span>
+          <span class='department'>教务处</span><p>请提交报名材料。</p>
+        </article></body></html>
+        """.encode("utf-8")
+        result = extract_page(response, profile)
+        self.assertEqual(result["title"], "学院比赛通知")
+        self.assertEqual(result["published_at"], "2026-10-01")
+        self.assertEqual(result["department"], "教务处")
+        self.assertIn("请提交报名材料", result["content"])
+        self.assertNotIn("不要保存", result["content"])
+
     def test_normalize_date(self):
         self.assertEqual(normalize_date("发布时间：2026/07/10"), "2026-07-10")
         self.assertEqual(normalize_date("2026年7月10日 09:05"), "2026-07-10 09:05")

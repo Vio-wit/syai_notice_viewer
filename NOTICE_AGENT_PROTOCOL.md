@@ -83,7 +83,29 @@ Set-Location -LiteralPath 'K:\syai_notice_viewer'
 
 附件提取状态必须如实报告。文字格式和 DOCX/XLSX/PPTX 可直接处理；PDF 没有 `pypdf` 时记录 `NEEDS_PDF_DEPENDENCY`；扫描 PDF/图片记录 `NEEDS_OCR`；旧版 DOC/XLS/PPT 记录 `LEGACY_BINARY_UNSUPPORTED`。
 
-## 3. 结果检查
+## 3.1 专业模式：其他页面采集
+
+专业模式用于与原学院通知来源不同的网页。它是轻量本地实现，支持受限深度采集、HTML/JSON/TEXT 解析、CSS 选择器、分页规则、登录会话、附件、robots.txt、域名/同源白名单、私网地址拦截、请求和响应大小限制及增量入库。配置字段以 `config.example.json` 的 `professional` 为准。
+
+常用命令：
+
+```powershell
+.\.venv\Scripts\python.exe notice_viewer.py professional-status
+.\.venv\Scripts\python.exe notice_viewer.py professional-login-test
+.\.venv\Scripts\python.exe notice_viewer.py professional-update --json --notify
+```
+
+本地 API：
+
+- `GET /api/professional/config`：读取脱敏配置状态。
+- `POST /api/professional/config`：保存或清除个人专业模式配置；只有本机可调用。
+- `POST /api/professional/login-test`：只建立并关闭登录会话，不采集页面；只有本机可调用。
+- `GET /api/professional/status`：查看专业模式任务状态。
+- `POST /api/professional/update`：触发采集，可传 `{"notify":true}`。
+
+专业模式结果使用 `notice_type=professional`，仍写入相同的通知、附件、规则分析和可选 AI 纪要表。Agent 回报时应保存 `mode`、`profile_name`、`processed`、`created`、`changed`、`unchanged`、`failed`、`attachment_references`、`new_notice_keys` 和 `errors`。没有真实目标配置时不要启用或执行它；不要把账号、密码、Bearer Token、自定义请求头或 `data/professional_config.json` 提交到 Git。
+
+## 4. 结果检查
 
 Agent 必须保存并回报命令输出中的这些字段：
 
@@ -97,7 +119,7 @@ Agent 必须保存并回报命令输出中的这些字段：
 
 `listed_before_filter` 只是来源接口本次返回的条数，不等于网站全部历史数据。若来源接口只返回最近一页，必须报告“历史完整性无法确认”，不能声称已覆盖全部历史。
 
-## 4. 分类约定
+## 5. 分类约定
 
 分类值使用稳定英文枚举，页面显示中文名称：
 
@@ -116,7 +138,7 @@ Agent 必须保存并回报命令输出中的这些字段：
 
 一条通知可以有多个分类，`primary_category` 表示最主要分类。分类必须基于标题、正文或附件名称中的证据；无法判断时使用 `other`，不要猜测。
 
-## 5. Agent 分析写回接口
+## 6. Agent 分析写回接口
 
 先获取通知：
 
@@ -166,7 +188,7 @@ Agent 纪要写回后，网页详情会显示 `updated_at` 对应的最近解析
 - `confidence` 范围为 `0` 到 `1`。
 - 不确定的信息写“需查看原文/附件确认”，不要编造截止时间、地点或资格。
 
-## 6. 采集安全规则
+## 7. 采集安全规则
 
 - 不删除 `data/`、`attachments/` 或数据库记录。
 - 不覆盖凭据文件。

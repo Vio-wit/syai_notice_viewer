@@ -32,6 +32,13 @@ from bs4 import BeautifulSoup
 from document_pipeline import EXTRACTED_DIR, extract_text, write_notice_artifacts
 from notice_analysis import CATEGORY_LABELS, analyze_notice, normalize_agent_analysis, normalize_agent_brief
 from notice_ai import DEFAULT_AI_CONFIG, NoticeAIClient, NoticeAIError, ai_config_status, save_ai_config
+from professional_mode import (
+    ProfessionalConfigError,
+    ProfessionalCrawler,
+    professional_config_status,
+    resolve_professional_config,
+    save_professional_config,
+)
 
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -63,6 +70,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "port": 8765,
     "notifications": {"enabled": True, "desktop": False},
     "ai": dict(DEFAULT_AI_CONFIG),
+    "professional": {},
 }
 
 HEADERS = {
@@ -1133,6 +1141,106 @@ def perform_update(
         return result
 
 
+def perform_professional_update(config: dict[str, Any], notify: bool = False) -> dict[str, Any]:
+    """按“专业模式”配置采集通用网页，并复用本地通知/分析/AI 管线。"""
+
+    store = NoticeStore()
+    run_id = store.start_run()
+    created_count = 0
+    changed_count = 0
+    failed_count = 0
+    new_items: list[dict[str, Any]] = []
+    ai_client = NoticeAIClient(config)
+    ai_summary: dict[str, Any] = {
+        "auto_brief": ai_client.auto_brief,
+        "ready": ai_client.ready,
+        "attempted": 0,
+        "succeeded": 0,
+        "failed": 0,
+        "skipped": 0,
+        "errors": [],
+    }
+    if ai_client.auto_brief and not ai_client.ready:
+        ai_summary["skipped_reason"] = "未配置或未启用 AI"
+    try:
+        profile, source = resolve_professional_config(config)
+        if not profile.get("enabled"):
+            raise ProfessionalConfigError("专业模式未启用")
+        crawler = ProfessionalCrawler(profile)
+
+        def handle_item(item: dict[str, Any], active_crawler: ProfessionalCrawler) -> tuple[bool, bool, int]:
+            nonlocal created_count, changed_count
+            key = notice_key(item)
+            old = store.get(key)
+            created, changed = store.upsert(item)
+            effective_changed = changed or (old is not None and not profile["output"]["incremental_enabled"])
+            store.save_analysis(key, analyze_notice(item))
+            attachments = item.get("attachments", [])
+            if profile["output"]["download_attachments"]:
+                for attachment in attachments:
+                    active_crawler.download_attachment(key, attachment, store)
+                    if profile["limits"]["request_interval_ms"]:
+                        time.sleep(profile["limits"]["request_interval_ms"] / 1000)
+            if (created or effective_changed) and ai_client.auto_brief:
+                if not ai_client.ready:
+                    ai_summary["skipped"] += 1
+                else:
+                    ai_summary["attempted"] += 1
+                    try:
+                        generate_ai_brief_for_notice(config, key, store)
+                        ai_summary["succeeded"] += 1
+                    except Exception as exc:
+                        ai_summary["failed"] += 1
+                        ai_summary["errors"].append({"notice_key": key, "error": str(exc)[:500]})
+            refresh_notice_artifacts(store, key)
+            if created or effective_changed:
+                new_items.append(item)
+            created_count += int(created)
+            changed_count += int(effective_changed)
+            return created, effective_changed, len(attachments)
+
+        summary = crawler.crawl(handle_item)
+        failed_count = int(summary.get("failed", 0))
+        result = {
+            "status": "SUCCESS" if failed_count == 0 else "PARTIAL",
+            "mode": "professional",
+            "profile_name": profile["profile_name"],
+            "config_source": source,
+            "run_id": run_id,
+            "finished_at": now_text(),
+            "processed": summary.get("processed", 0),
+            "listed": summary.get("processed", 0),
+            "created": created_count,
+            "changed": changed_count,
+            "unchanged": summary.get("unchanged", 0),
+            "failed": failed_count,
+            "attachment_references": summary.get("attachment_references", 0),
+            "errors": summary.get("errors", []),
+            "new_notice_keys": [notice_key(item) for item in new_items],
+            "ai": ai_summary,
+        }
+        store.finish_run(run_id, result["status"], created_count, changed_count, failed_count)
+        (DATA_DIR / "last_professional_update.json").write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
+        if notify and new_items:
+            send_notifications(config, new_items)
+        return result
+    except Exception as exc:
+        store.finish_run(run_id, "FAILED", created_count, changed_count, failed_count, str(exc))
+        result = {
+            "status": "FAILED",
+            "mode": "professional",
+            "run_id": run_id,
+            "finished_at": now_text(),
+            "created": created_count,
+            "changed": changed_count,
+            "failed": failed_count,
+            "error": str(exc)[:500],
+            "ai": ai_summary,
+        }
+        (DATA_DIR / "last_professional_update.json").write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
+        return result
+
+
 def send_notifications(config: dict[str, Any], items: list[dict[str, Any]]) -> None:
     if not config.get("notifications", {}).get("enabled", True):
         return
@@ -1192,6 +1300,37 @@ class UpdateManager:
                     self.state["running"] = False
                 UPDATE_LOCK.release()
         threading.Thread(target=worker, name="notice-update", daemon=True).start()
+        return True
+
+    def snapshot(self) -> dict[str, Any]:
+        with self.lock:
+            return dict(self.state)
+
+
+class ProfessionalUpdateManager:
+    def __init__(self, config: dict[str, Any]):
+        self.config = config
+        self.state: dict[str, Any] = {"running": False, "last": None, "error": None}
+        self.lock = threading.Lock()
+
+    def start(self, notify: bool = False) -> bool:
+        with self.lock:
+            if self.state["running"] or not UPDATE_LOCK.acquire(blocking=False):
+                return False
+            self.state.update({"running": True, "started_at": now_text(), "error": None})
+
+        def worker() -> None:
+            try:
+                result = perform_professional_update(self.config, notify=notify)
+                with self.lock:
+                    self.state["last"] = result
+                    self.state["error"] = result.get("error")
+            finally:
+                with self.lock:
+                    self.state["running"] = False
+                UPDATE_LOCK.release()
+
+        threading.Thread(target=worker, name="professional-update", daemon=True).start()
         return True
 
     def snapshot(self) -> dict[str, Any]:
@@ -1319,6 +1458,7 @@ def render_home(
 
 class RequestHandler(BaseHTTPRequestHandler):
     manager: UpdateManager
+    professional_manager: ProfessionalUpdateManager
     store: NoticeStore
 
     def log_message(self, format: str, *args: Any) -> None:
@@ -1393,6 +1533,15 @@ class RequestHandler(BaseHTTPRequestHandler):
                 return
             self.send_json(ai_config_status(self.manager.config))
             return
+        if parsed.path == "/api/professional/config":
+            if not self.is_local_request():
+                self.send_json({"error": "专业模式配置只允许本机访问"}, 403)
+                return
+            self.send_json(professional_config_status(self.manager.config))
+            return
+        if parsed.path == "/api/professional/status":
+            self.send_json(self.professional_manager.snapshot())
+            return
         if parsed.path == "/api/notices":
             query = parse_qs(parsed.query)
             unread = query.get("unread", ["0"])[0] == "1"
@@ -1443,6 +1592,40 @@ class RequestHandler(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:
         parsed = urlparse(self.path)
+        if parsed.path == "/api/professional/config":
+            if not self.is_local_request():
+                self.send_json({"error": "专业模式配置只允许本机访问"}, 403)
+                return
+            payload = self.read_json_body(100000)
+            try:
+                status = save_professional_config(self.manager.config, payload)
+            except (ProfessionalConfigError, ValueError) as exc:
+                self.send_json({"error": str(exc)}, 400)
+                return
+            self.send_json({"ok": True, "status": status})
+            return
+        if parsed.path == "/api/professional/login-test":
+            if not self.is_local_request():
+                self.send_json({"error": "专业模式登录测试只允许本机访问"}, 403)
+                return
+            try:
+                profile, _ = resolve_professional_config(self.manager.config)
+                if not profile.get("enabled"):
+                    raise ProfessionalConfigError("专业模式未启用")
+                result = ProfessionalCrawler(profile).test_login()
+            except (ProfessionalConfigError, ValueError) as exc:
+                self.send_json({"success": False, "error": str(exc)}, 400)
+                return
+            self.send_json(result, 200 if result.get("success") else 502)
+            return
+        if parsed.path == "/api/professional/update":
+            if not self.is_local_request():
+                self.send_json({"error": "专业模式更新只允许本机访问"}, 403)
+                return
+            payload = self.read_json_body(10000)
+            started = self.professional_manager.start(notify=bool(payload.get("notify")))
+            self.send_json({"accepted": started, "status": self.professional_manager.snapshot()}, 202 if started else 409)
+            return
         if parsed.path == "/api/config/ai":
             if not self.is_local_request():
                 self.send_json({"error": "AI 配置只允许本机访问"}, 403)
@@ -1573,8 +1756,13 @@ class RequestHandler(BaseHTTPRequestHandler):
 
 def run_server(config: dict[str, Any]) -> None:
     manager = UpdateManager(config)
+    professional_manager = ProfessionalUpdateManager(config)
     store = NoticeStore()
-    handler = type("ConfiguredRequestHandler", (RequestHandler,), {"manager": manager, "store": store})
+    handler = type(
+        "ConfiguredRequestHandler",
+        (RequestHandler,),
+        {"manager": manager, "professional_manager": professional_manager, "store": store},
+    )
     server = ThreadingHTTPServer((str(config.get("bind_host", "127.0.0.1")), int(config.get("port", 8765))), handler)
     print(f"学院通知查看器已启动: http://{config.get('bind_host', '127.0.0.1')}:{config.get('port', 8765)}")
     try:
@@ -1602,6 +1790,11 @@ def main() -> int:
     sub.add_parser("extract-attachments", help="提取已下载附件的文本，记录不支持的格式")
     sub.add_parser("check-config", help="检查账号和本地配置是否齐全，不执行登录")
     sub.add_parser("ai-status", help="检查 AI 配置状态，不返回 API Key")
+    sub.add_parser("professional-status", help="检查专业模式配置状态，不执行采集")
+    professional_update = sub.add_parser("professional-update", help="按专业模式采集并分析通用网页")
+    professional_update.add_argument("--notify", action="store_true", help="有新增时打印提醒并按配置尝试桌面提醒")
+    professional_update.add_argument("--json", action="store_true", help="只输出 JSON 摘要")
+    sub.add_parser("professional-login-test", help="测试专业模式登录会话，不采集页面")
     ai_brief = sub.add_parser("ai-brief", help="为一条通知调用 AI 生成分析和纪要")
     ai_brief.add_argument("notice_key", help="通知键，例如 notice:10108")
     notify = sub.add_parser("notify", help="输出当前未读通知")
@@ -1630,6 +1823,24 @@ def main() -> int:
     if args.command == "ai-status":
         print(json.dumps(ai_config_status(config), ensure_ascii=False))
         return 0
+    if args.command == "professional-status":
+        result = professional_config_status(config)
+        print(json.dumps(result, ensure_ascii=False))
+        return 0 if result["status"] in {"READY", "DISABLED"} else 1
+    if args.command == "professional-login-test":
+        try:
+            profile, _ = resolve_professional_config(config)
+            if not profile.get("enabled"):
+                raise ProfessionalConfigError("专业模式未启用")
+            result = ProfessionalCrawler(profile).test_login()
+        except (ProfessionalConfigError, ValueError) as exc:
+            result = {"success": False, "error": str(exc)}
+        print(json.dumps(result, ensure_ascii=False))
+        return 0 if result.get("success") else 1
+    if args.command == "professional-update":
+        result = perform_professional_update(config, notify=args.notify)
+        print(json.dumps(result, ensure_ascii=False, indent=None if args.json else 2))
+        return 0 if result["status"] != "FAILED" else 1
     store = NoticeStore()
     if args.command == "analyze":
         result = analyze_existing_notices()

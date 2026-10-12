@@ -113,6 +113,36 @@ Invoke-RestMethod -Method Post http://127.0.0.1:8765/api/notices/notice%3A10108/
 
 AI 配置和单条解读 API 仅允许本机访问。其他 Agent 仍可以按原协议直接 POST `/api/notices/{notice_key}/analysis` 和 `/api/notices/{notice_key}/brief`，不依赖外部 AI。
 
+## 专业模式：通用网页采集与分析
+
+专业模式是从原项目的复杂爬虫逻辑中抽出的轻量实现，用于采集其他学院、实验室或公开信息页面。它保留了原项目中比较有价值的边界：同源/域名白名单、robots.txt、重定向检查、私网与回环地址拦截、登录会话、Bearer/自定义请求头、HTML/JSON/TEXT 解析、CSS 选择器、分页、深度/页数/响应体/总流量上限、附件引用和增量去重；不引入 Spring、MySQL、MinIO 或 RagFlow。
+
+每个人只需要在自己的 `config.local.json` 或被忽略的 `data/professional_config.json` 中配置目标网站。示例模板见 `config.example.json`，密码、Token 和自定义请求头不要提交到 Git：
+
+```powershell
+Copy-Item config.example.json config.local.json
+# 在 config.local.json 的 professional 中填写 site_url、entry_url 和 parser
+.\.venv\Scripts\python.exe notice_viewer.py professional-status
+.\.venv\Scripts\python.exe notice_viewer.py professional-login-test
+.\.venv\Scripts\python.exe notice_viewer.py professional-update --json --notify
+```
+
+也可以让本地 Agent 通过 API 操作。配置、登录测试和更新触发接口只接受本机请求；配置状态只返回脱敏结果：
+
+```powershell
+Invoke-RestMethod 'http://127.0.0.1:8765/api/professional/config'
+Invoke-RestMethod -Method Post `
+  -Uri 'http://127.0.0.1:8765/api/professional/config' `
+  -ContentType 'application/json' `
+  -Body (Get-Content .\professional-profile.json -Raw)
+Invoke-RestMethod -Method Post `
+  -Uri 'http://127.0.0.1:8765/api/professional/update' `
+  -ContentType 'application/json' -Body '{"notify":true}'
+Invoke-RestMethod 'http://127.0.0.1:8765/api/professional/status'
+```
+
+专业模式采集出的记录类型为 `professional`，会进入同一个 SQLite、附件、规则分析和可选 AI 纪要流程；因此可直接用 `/api/notices` 查询，也可用 `ai.auto_brief` 自动解读新增或发生变化的页面。没有提供真实目标配置时，专业模式保持禁用，不会主动联网。
+
 ## 安装与运行
 
 在 PowerShell 中执行：
