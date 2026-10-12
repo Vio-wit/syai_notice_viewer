@@ -9,10 +9,10 @@
 
 ## 当前账号来源
 
-`config.local.json` 默认只引用原项目中的个人配置文件，不复制密码：
+`config.local.json` 默认只引用项目外部的个人配置文件，不复制密码。例如：
 
 ```text
-K:\syai_main\plan_b_爬虫兜底\config.json
+C:\Users\你的用户名\.notice-viewer\credentials.json
 ```
 
 也可以改成环境变量：
@@ -143,7 +143,9 @@ http://127.0.0.1:8765/?q=比赛&since=2026-08-31&until=2026-09-27&category=compe
 
 重复采集时，通知按“来源类型 + 源站 ID”去重；没有源站 ID 的发文按规范化 URL 生成稳定键。附件按“通知 + 附件 URL”去重。重复运行不会新增重复记录，结果中的 `created`、`changed`、`unchanged` 分别表示新增、内容变化和已存在且未变化的数量。
 
-生成原文快照和当前规则版纪要：
+采集不会自动生成或覆盖 Agent 纪要：`update` 只处理通知、附件和规则分类（`notice_analysis`，`source` 为 `rules-v1`），已写回的 `notice_briefs` 和 `data/summaries/` 保持原样。新增的 `created` 和内容变化的 `changed` 通知需要 Agent 重新通过 `/api/notices/{notice_key}/analysis` 与 `/api/notices/{notice_key}/brief` 写回，否则详情页会显示“尚未生成 Agent 纪要”，或继续显示基于旧正文的纪要。
+
+生成原文快照和纪要（已有 Agent 纪要时生成 Agent 版，否则生成规则版）：
 
 ```powershell
 .\.venv\Scripts\python.exe notice_viewer.py export

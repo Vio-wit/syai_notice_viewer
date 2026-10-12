@@ -69,7 +69,7 @@ Set-Location -LiteralPath 'K:\syai_notice_viewer'
 .\.venv\Scripts\python.exe notice_viewer.py analyze
 ```
 
-为现有数据生成原文快照和规则版纪要：
+为现有数据生成原文快照和纪要（有 Agent 纪要时生成 Agent 版，否则生成规则版）：
 
 ```powershell
 .\.venv\Scripts\python.exe notice_viewer.py export
@@ -158,6 +158,7 @@ Agent 纪要写回后，网页详情会显示 `updated_at` 对应的最近解析
 
 写回要求：
 
+- `update` 不会生成、也不会覆盖 `notice_briefs`；采集后必须对结果里的 `new_notice_keys` 和 `changed` 对应的 key 重新生成纪要并写回，否则新通知没有纪要、内容变化的通知仍是旧纪要。
 - `source` 使用 `agent:<名称>`，规则分析使用 `rules-v1`。
 - 建议必须是可执行动作，不要只写“值得关注”。
 - `confidence` 范围为 `0` 到 `1`。
